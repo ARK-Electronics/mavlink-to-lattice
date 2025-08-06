@@ -7,9 +7,14 @@ To obtain access tokens and credentials, please reach out to **Anduril**.
 Once a MAVSDK connection is established, the application initializes a Lattice Client instance and runs asynchronously, continuously publishing UAV telemetry data to the Lattice system.
 
 ### Instructions
+Install the SDK for REST in Python
+```
+pip install anduril-lattice-sdk
+```
+
 You will need the following:
 - **SANDBOXES_TOKEN** – Bearer token for sandbox authentication
-- **LATTICE_URL** – Endpoint URL of your Lattice environment
+- **LATTICE_ENDPOINT** – Endpoint URL of your Lattice environment
 - **ENVIRONMENT_TOKEN** – Token scoped to your Lattice environment
 
 
@@ -21,10 +26,5 @@ source setup.sh
 You should have a drone running.
 Then you should be able to run the script using
 ```
-python3 main.py
+python3 lattice_publisher.py 
 ```
-
-
-
-
-
