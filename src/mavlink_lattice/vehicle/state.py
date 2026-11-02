@@ -81,6 +81,9 @@ class VehicleState:
     prearm_ok: bool | None = None  # None until the autopilot reports its pre-arm check state
 
     mission_current: int = -1
+    mission_total: int = 0
+    # MISSION_STATE_*. PX4 versions that don't report it leave 0, unknown.
+    mission_state: int = 0
     mission_reached: int = -1
     uid: int = 0  # hardware UID from AUTOPILOT_VERSION, 0 if not reported
 
@@ -150,6 +153,8 @@ class VehicleState:
             b.time_remaining_s = float(msg.time_remaining) if getattr(msg, "time_remaining", 0) > 0 else None
         elif t == "MISSION_CURRENT":
             self.mission_current = msg.seq
+            self.mission_total = getattr(msg, "total", 0)
+            self.mission_state = getattr(msg, "mission_state", 0)
         elif t == "MISSION_ITEM_REACHED":
             self.mission_reached = msg.seq
         elif t == "AUTOPILOT_VERSION":

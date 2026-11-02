@@ -1,4 +1,4 @@
 from .base import Executor, TaskContext, TaskFailed, TaskRejected
-from .manager import EXECUTORS, TaskManager
+from .manager import TASKS, TaskManager
 
-__all__ = ["EXECUTORS", "Executor", "TaskContext", "TaskFailed", "TaskManager", "TaskRejected"]
+__all__ = ["TASKS", "Executor", "TaskContext", "TaskFailed", "TaskManager", "TaskRejected"]

@@ -3,6 +3,7 @@
     export LATTICE_URL=http://127.0.0.1:8080 LATTICE_TOKEN=dev
     lattice-task marshal mavlink-sys1 47.3980 8.5457 --name pickup
     lattice-task transit mavlink-sys1 47.3980,8.5457 47.3982,8.5460
+    lattice-task evacuate mavlink-sys1 type.googleapis.com/test.v1.Evacuate --pickup 47.3980 8.5457 --dropoff 47.3982 8.5460
     lattice-task watch <task-id>
     lattice-task cancel <task-id>
     lattice-task complete <task-id>     # fake server only; on real Lattice an operator does this in the UI
@@ -66,6 +67,19 @@ async def _run(args) -> None:
         pts = [tuple(float(v) for v in p.split(",")) for p in args.points]
         path = [{"waypoint": {"llaPoint": _point(lat, lon)}} for lat, lon in pts]
         await _create(client, args.assignee, "Transit", {"plan": {"route": {"path": path}}}, f"route of {len(pts)} waypoints")
+    elif args.cmd == "evacuate":
+        spec = {}
+        if args.pickup:
+            spec["pickup"] = _point(*args.pickup)
+        if args.dropoff:
+            spec["dropoff"] = _point(*args.dropoff)
+        task = await client.tasks.create_task(
+            specification=GoogleProtobufAny.model_validate({"@type": args.type_url, **spec}),
+            relations=Relations(assignee=Principal(system=System(entity_id=args.assignee))),
+            author=Principal(user=User(user_id=os.environ.get("USER", "operator"))),
+            description="evacuate",
+        )
+        print(task.version.task_id)
     elif args.cmd == "cancel":
         await client.tasks.cancel_task(args.task_id, author=Principal(user=User(user_id=os.environ.get("USER", "operator"))))
     elif args.cmd == "complete":
@@ -90,6 +104,11 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("transit", help="drive a route")
     p.add_argument("assignee")
     p.add_argument("points", nargs="+", metavar="LAT,LON")
+    p = sub.add_parser("evacuate", help="a stand-in Evacuate task with pickup and/or dropoff, for the default field paths")
+    p.add_argument("assignee")
+    p.add_argument("type_url", help="the type URL set in tasks.evacuate.type_url")
+    p.add_argument("--pickup", nargs=2, type=float, metavar=("LAT", "LON"))
+    p.add_argument("--dropoff", nargs=2, type=float, metavar=("LAT", "LON"))
     for name in ("cancel", "complete", "watch"):
         sub.add_parser(name).add_argument("task_id")
     asyncio.run(_run(parser.parse_args(argv)))

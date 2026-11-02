@@ -59,6 +59,32 @@ def test_config(tmp_path):
     path.write_text('[lattice]\nurl = "https://x"\n')
     with pytest.raises(ValueError, match="token"):
         config.load(path, env={})
+    assert config.load(path, env={"LATTICE_TOKEN": "t"}).vehicle.mavlink == "udpin:127.0.0.1:14540"
+
+
+def test_tasks_config(tmp_path):
+    path = tmp_path / "c.toml"
+    base = '[lattice]\nurl = "https://x"\ntoken = "t"\n'
+    path.write_text(base + '[tasks]\nenabled = ["evacuate"]\n[tasks.evacuate]\ntype_url = "type.googleapis.com/a.v1.Evacuate"\npickup = "pickup.point"\n')
+    cfg = config.load(path, env={})
+    assert cfg.tasks.enabled == ["evacuate"]
+    assert cfg.tasks.evacuate.type_url == "type.googleapis.com/a.v1.Evacuate" and cfg.tasks.evacuate.pickup == "pickup.point"
+    assert cfg.tasks.evacuate.dropoff == "dropoff"
+    path.write_text(base + '[tasks]\nenabled = ["evacuate"]\n')
+    with pytest.raises(ValueError, match="type_url"):
+        config.load(path, env={})
+    path.write_text(base + '[tasks]\nenabled = ["evacuate"]\n[tasks.evacuate]\ntype_url = "type.googleapis.com/anduril.tasks.v2.Marshal"\n')
+    with pytest.raises(ValueError, match="built-in"):
+        config.load(path, env={})
+    path.write_text(base + '[tasks]\nenabled = ["evacuate"]\n[tasks.evacuate]\ntype_url = "type.googleapis.com/a.v1.Evacuate"\narrival_radius_m = 0\n')
+    with pytest.raises(ValueError, match="arrival_radius_m"):
+        config.load(path, env={})
+    path.write_text(base + '[tasks]\nenabled = ["marshall"]\n')
+    with pytest.raises(ValueError, match="marshall"):
+        config.load(path, env={})
+    path.write_text(base + '[tasks.evacuate]\npickpu = "x"\n')
+    with pytest.raises(ValueError, match="pickpu"):
+        config.load(path, env={})
 
 
 async def _task(fake, client):

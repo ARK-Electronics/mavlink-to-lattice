@@ -52,8 +52,16 @@ def lla_of(point: dict, what: str) -> tuple[float, float]:
 
 class Executor:
     type_url: ClassVar[str]
+    # False when the operator drives the vehicle and the bridge only reports. Then nothing about the task makes the
+    # bridge command the vehicle: not its end, a mode change, a disarm or a bridge restart.
+    drives: ClassVar[bool] = True
     # The vehicle must stay in this mode once it gets there; leaving it (RC or GCS takeover, a failsafe) fails the task.
     expected_mode: ClassVar[Mode]
+
+    @classmethod
+    def advertised_type(cls, cfg: Config) -> str:
+        """The task type URL this executor is listed under in the entity's task catalog."""
+        return cls.type_url
 
     def __init__(self, ctx: TaskContext, spec: dict):
         """Parse the task specification (proto JSON, without "@type"); raise TaskRejected if it's unusable."""
@@ -73,3 +81,9 @@ class Executor:
 
     async def close(self) -> None:
         """Release anything the executor started (always called once the task ends)."""
+
+    def continue_from(self, old: Executor) -> None:
+        """This executor replaces `old` because the task was edited. Carry over what still applies."""
+
+    def ended(self, status: str, message: str | None) -> None:
+        """The task's outcome, once decided, however it ended."""

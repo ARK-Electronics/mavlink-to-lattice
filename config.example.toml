@@ -13,6 +13,19 @@ arrival_radius_m = 2.0
 # 0 keeps PX4's cruise speed.
 speed_mps = 0.0
 
+[tasks]
+# Marshal and Transit drive the vehicle from Lattice. Evacuate leaves the driving to the ground station operator.
+# Enable it alone to keep Lattice from driving the vehicle.
+enabled = ["marshal", "transit"]
+
+[tasks.evacuate]
+# Required with "evacuate" enabled: the Evacuate task's type URL.
+type_url = ""
+# Dotted proto field paths to the pickup and dropoff positions in the task.
+pickup = "pickup"
+dropoff = "dropoff"
+arrival_radius_m = 10.0
+
 [entity]
 # Empty: derived from the autopilot's hardware UID ("mavlink-<uid>").
 id = ""

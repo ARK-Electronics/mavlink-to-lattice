@@ -9,7 +9,7 @@ import pytest
 from anduril import AsyncLattice, GoogleProtobufAny, Principal, Relations, System
 
 from mavlink_lattice.bridge import Bridge
-from mavlink_lattice.config import Config, EntityConfig, LatticeConfig, VehicleConfig
+from mavlink_lattice.config import Config, EntityConfig, LatticeConfig, TasksConfig, VehicleConfig
 from mavlink_lattice.testing.fake_lattice import FakeLattice
 from mavlink_lattice.testing.sim_vehicle import SimRover
 
@@ -112,13 +112,19 @@ def vehicle_cfg() -> VehicleConfig:
 
 
 @pytest.fixture
-async def harness(fake, vehicle_cfg, tmp_path):
+def tasks_cfg() -> TasksConfig:
+    return TasksConfig()
+
+
+@pytest.fixture
+async def harness(fake, vehicle_cfg, tasks_cfg, tmp_path):
     port = free_udp_port()
     vehicle_cfg.mavlink = f"udpin:127.0.0.1:{port}"
     cfg = Config(
         vehicle=vehicle_cfg,
         entity=EntityConfig(publish_period_s=0.2, simulated=True),
         lattice=LatticeConfig(url=fake.url, token=TOKEN, heartbeat_interval_s=0.5),
+        tasks=tasks_cfg,
         state_dir=str(tmp_path),
     )
     sim = SimRover(port, speed_mps=15.0)

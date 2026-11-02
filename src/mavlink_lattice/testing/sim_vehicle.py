@@ -1,8 +1,9 @@
 """A minimal simulated PX4 rover over MAVLink, for fast tests of the whole bridge without a PX4 build.
 
 It models only what the bridge relies on: heartbeat with PX4 custom modes, arming, DO_SET_MODE,
-DO_REPOSITION (drive straight to the point in Hold), RTL, mission upload and MISSION mode with
-MISSION_ITEM_REACHED, and the telemetry the entity is built from. Faults can be injected: a mode change
+DO_REPOSITION, RTL, mission upload, MISSION mode with MISSION_ITEM_REACHED and MISSION_CURRENT's mission
+state, the telemetry the entity is built from, and a record of the STATUSTEXTs the bridge sends. A
+reposition drives straight to the point in Hold. As in PX4, a mission uploaded in MISSION mode starts over. Faults can be injected: a mode change
 from elsewhere, disarm, telemetry silence, refused commands. Real PX4 behaviour is covered by the SITL tests.
 """
 
@@ -47,6 +48,9 @@ class SimRover:
         self.refuse: dict[int, int] = {}  # command -> MAV_RESULT to answer with
         self.ignore: dict[int, int] = {}  # command -> number of times to stay silent
         self.commands: list[int] = []
+        self.statustexts: list[str] = []
+        # False acts like a PX4 that predates MISSION_CURRENT's mission state.
+        self.reports_mission_state = True
         self.arm_delay_s = 0.0
         # Another component on the autopilot's system ID (a camera), sending its own disarmed heartbeat.
         self.camera = False
@@ -98,6 +102,17 @@ class SimRover:
             return self.home
         return None
 
+    def _mission_state(self) -> int:
+        if not self.reports_mission_state:
+            return 0
+        if not self.mission:
+            return M.MISSION_STATE_NO_MISSION
+        if self.mission_seq >= len(self.mission):
+            return M.MISSION_STATE_COMPLETE
+        if self.mode == Mode.MISSION:
+            return M.MISSION_STATE_ACTIVE
+        return M.MISSION_STATE_PAUSED if self.mission_seq > 0 else M.MISSION_STATE_NOT_STARTED
+
     def _advance_mission(self) -> None:
         while self.mission_seq < len(self.mission) and self.mission[self.mission_seq].command != M.MAV_CMD_NAV_WAYPOINT:
             self.mission_seq += 1
@@ -141,6 +156,7 @@ class SimRover:
                 self._send(self.mav.battery_status_encode(0, 0, 0, 0, [16800] + [65535] * 9, 1200, -1, -1, 76))
                 prearm = M.MAV_SYS_STATUS_PREARM_CHECK
                 self._send(self.mav.sys_status_encode(0, 0, prearm, 500, 16800, 1200, 76, 0, 0, 0, 0, 0, 0))
+                self._send(self.mav.mission_current_encode(self.mission_seq, len(self.mission), self._mission_state()))
             if tick % 4 == 0:
                 vn, ve = self.vel
                 heading = math.atan2(ve, vn) if (vn or ve) else 0.0
@@ -160,6 +176,8 @@ class SimRover:
         t = msg.get_type()
         if t in ("COMMAND_LONG", "COMMAND_INT"):
             self._command(msg)
+        elif t == "STATUSTEXT":
+            self.statustexts.append(msg.text)
         elif t == "MISSION_COUNT":
             self._upload = [None] * msg.count
             if msg.count == 0:

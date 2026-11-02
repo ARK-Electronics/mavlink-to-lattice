@@ -6,9 +6,9 @@ EXECUTING once the vehicle accepted the commands, and DONE_OK or DONE_NOT_OK at 
 Two invariants, because this drives a real vehicle:
 - Every task received stays tracked until Lattice holds a terminal status for it. Unsent terminal statuses
   are retried in the background, and the open set is saved so a restarted bridge closes them out.
-- A task that ends stops the vehicle, unless someone else took control (a mode change or a disarm). A stop
-  is re-sent while the vehicle keeps moving in an auto mode, since an ack proves the command arrived, not
-  that the vehicle stopped.
+- A task that ends stops the vehicle, unless someone else took control with a mode change or a disarm, or
+  the operator drives the vehicle for that task, as in Evacuate. A stop is re-sent while the vehicle keeps
+  moving in an auto mode, since an ack proves the command arrived, not that the vehicle stopped.
 """
 
 from __future__ import annotations
@@ -29,12 +29,13 @@ from ..lattice.status import REQUESTS, TERMINAL, TaskStatusReporter
 from ..vehicle import CommandError, Mode
 from ..vehicle.state import GROUND, SURFACE
 from .base import Executor, TaskContext, TaskFailed, TaskRejected
+from .evacuate import Evacuate
 from .marshal import Marshal
 from .transit import Transit
 
 log = logging.getLogger(__name__)
 
-EXECUTORS: dict[str, type[Executor]] = {cls.type_url: cls for cls in (Marshal, Transit)}
+TASKS: dict[str, type[Executor]] = {"marshal": Marshal, "transit": Transit, "evacuate": Evacuate}
 
 TICK_S = 0.2
 # Time for PX4 to report the mode a command switched it to.
@@ -66,12 +67,14 @@ class _Active:
 class TaskManager:
     def __init__(self, ctx: TaskContext, state_dir: str = ""):
         self.ctx = ctx
+        self.executors = {cls.advertised_type(ctx.cfg): cls for cls in (TASKS[name] for name in ctx.cfg.tasks.enabled)}
         self.active: _Active | None = None
         self._open: dict[str, TaskStatusReporter] = {}
         self._unsent: dict[str, tuple[TaskStatusReporter, str, str | None, str | None]] = {}
         self._finished: OrderedDict[str, tuple[str, str | None, str | None]] = OrderedDict()
         self._state_file = Path(state_dir) / "open_tasks.json" if state_dir else None
         self._stop_pending = False  # a stop that didn't get through (link down); retried until it does
+        self._saved: str | None = None
         self._stopped_from: Mode | None = None
         self._stop_check_at = 0.0
         self._unsent_at = 0.0
@@ -82,7 +85,11 @@ class TaskManager:
         v = self.ctx.vehicle
         if not v.link_ok() or not v.state.has_position or v.state.mav_type not in GROUND | SURFACE:
             return []
-        return list(EXECUTORS)
+        return list(self.executors)
+
+    def _drives(self, task) -> bool:
+        cls = self.executors.get(task.specification.type if task.specification else None)
+        return cls.drives if cls else True
 
     @property
     def route(self):
@@ -140,7 +147,8 @@ class TaskManager:
         reporter = TaskStatusReporter(self.ctx.api, task_id, task.version.status_version or 0, status)
         self._track(reporter)
         if status in _AGENT_STARTED:
-            await self._stop_vehicle()
+            if self._drives(task):
+                await self._stop_vehicle()
             await self._end(reporter, "STATUS_DONE_NOT_OK", "ERROR_CODE_FAILED", "bridge restarted while running the task")
             return
         if reporter.requested:
@@ -151,21 +159,26 @@ class TaskManager:
             return
         try:
             executor, complete_before = self._accept(task)
-            await self._prepare_vehicle()
+            await self._prepare_vehicle(executor)
         except TaskRejected as exc:
             await self._end(reporter, "STATUS_DONE_NOT_OK", exc.code, str(exc))
             return
+        # A driving task's commands replace the old one's target, and its runner stops the vehicle if they fail. An
+        # operator-driven one sends no target, so the old one is stopped here.
+        old_target_left = bool(self.active and self.active.executor.drives and executor.drives)
         if self.active:
-            # The new task's commands replace the old target; its runner stops the vehicle if they fail.
-            await self._stop_active("STATUS_DONE_NOT_OK", "ERROR_CODE_CANCELLED", f"superseded by task {task_id}", stop=False)
+            await self._stop_active("STATUS_DONE_NOT_OK", "ERROR_CODE_CANCELLED", f"superseded by task {task_id}", stop=not executor.drives)
         await reporter.set("STATUS_WILCO")
         if await self._closed_meanwhile(reporter):
-            await self._stop_vehicle()
+            if old_target_left:
+                await self._stop_vehicle()
             return
         active = _Active(task_id, definition, reporter, executor, complete_before)
         active.runner = asyncio.create_task(self._run(active), name=f"task-{task_id}")
         self.active = active
-        self._stop_pending, self._stopped_from = False, None  # the new task commands the vehicle now
+        if executor.drives:
+            self._stop_pending, self._stopped_from = False, None  # the new task commands the vehicle now
+        self._save()
 
     async def _closed_meanwhile(self, reporter: TaskStatusReporter) -> bool:
         """The task ended on the server, or an operator asked to end it, before we started running it."""
@@ -181,7 +194,7 @@ class TaskManager:
     def _accept(self, task) -> tuple[Executor, datetime | None]:
         spec = task.specification
         type_url = spec.type if spec else None
-        cls = EXECUTORS.get(type_url)
+        cls = self.executors.get(type_url)
         if cls is None:
             raise TaskRejected(f"unsupported task type {type_url}")
         constraints = task.execution_constraints
@@ -192,7 +205,7 @@ class TaskManager:
             raise TaskRejected("scheduled tasks (startAfter) aren't supported")
         return cls(self.ctx, dict(spec.model_extra or {})), complete_before
 
-    async def _prepare_vehicle(self) -> None:
+    async def _prepare_vehicle(self, executor: Executor) -> None:
         v = self.ctx.vehicle
         if not v.link_ok():
             raise TaskRejected("no link to the vehicle")
@@ -200,6 +213,8 @@ class TaskManager:
             raise TaskRejected("tasks are only supported on ground and surface vehicles so far")
         if not v.state.has_position or v.state.gps_fix < 3:
             raise TaskRejected("vehicle has no global position")
+        if not executor.drives:
+            return  # arming is the operator's call
         if not v.state.armed:
             if not self.ctx.cfg.vehicle.auto_arm:
                 raise TaskRejected("vehicle is disarmed")
@@ -219,13 +234,20 @@ class TaskManager:
             executor, complete_before = self._accept(task)
         except TaskRejected as exc:
             self.active = None
-            await self._stop_vehicle()
+            if a.executor.drives:
+                await self._stop_vehicle()
+            a.executor.ended("STATUS_DONE_NOT_OK", f"edited task rejected: {exc}")
             await self._end(a.reporter, "STATUS_DONE_NOT_OK", exc.code, f"edited task rejected: {exc}")
             return
+        executor.continue_from(a.executor)
         log.info("task %s: definition %d replaces %d", a.task_id, task.version.definition_version, a.definition_version)
+        if a.executor.drives and not executor.drives:
+            # The edit made it operator-driven, so nothing will replace the old target.
+            await self._stop_vehicle()
         new = _Active(a.task_id, task.version.definition_version or 0, a.reporter, executor, complete_before)
         new.runner = asyncio.create_task(self._run(new), name=f"task-{a.task_id}")
         self.active = new
+        self._save()
 
     async def _end_on_request(self, task_id: str, outcome: tuple[str, str | None, str]) -> None:
         if self.active and self.active.task_id == task_id:
@@ -236,8 +258,8 @@ class TaskManager:
         reporter = self._open.get(task_id) or TaskStatusReporter(self.ctx.api, task_id, 0)
         if not await reporter.resync_quietly() and task_id not in self._open:
             return
-        if task_id in self._open:
-            await self._stop_vehicle()  # a task from before a restart, or one we were still starting
+        # No stop: nothing drives for a task that isn't running here. It ended here, which decided the stop, or before
+        # a restart, where recovery did. Requests are handled one at a time, so it can't be still starting.
         await self._end(reporter, *outcome)
 
     # --- running ---
@@ -251,8 +273,9 @@ class TaskManager:
         active.runner.cancel()
         await asyncio.gather(active.runner, return_exceptions=True)
         await active.executor.close()
-        if stop:
+        if stop and active.executor.drives:
             await self._stop_vehicle()
+        active.executor.ended(status, message)
         await self._end(active.reporter, status, code, message)
 
     async def _run(self, active: _Active) -> None:
@@ -278,13 +301,14 @@ class TaskManager:
         active.finishing = True
         status, code, message, stop = outcome
         await ex.close()
-        if stop == "finish":
+        ex.ended(status, message)
+        if ex.drives and stop == "finish":
             try:
                 await ex.finish()
             except CommandError as exc:
                 log.warning("task %s: reached the goal, but %s", active.task_id, exc)
                 await self._stop_vehicle()
-        elif stop:
+        elif ex.drives and stop:
             await self._stop_vehicle()
         if executing:
             await asyncio.gather(executing, return_exceptions=True)  # EXECUTING must land before the end
@@ -307,21 +331,27 @@ class TaskManager:
             if active.reporter.terminal:
                 return None, None, None, True  # closed on the server by someone else
             s = v.state
-            if not v.link_ok():
-                raise TaskFailed("lost the link to the vehicle")
-            if not s.armed:
-                raise TaskFailed("vehicle disarmed", stop=False)
-            if s.mode == ex.expected_mode:
-                mode_reached = True
-            elif mode_reached:
-                raise TaskFailed(f"vehicle left {ex.expected_mode.name} for {s.mode.name}", stop=False)
-            elif time.monotonic() - started > MODE_GRACE_S:
-                raise TaskFailed(f"vehicle didn't switch to {ex.expected_mode.name} (in {s.mode.name})")
+            # The operator may drive, change modes and disarm as they see fit, such as to load a casualty.
+            if ex.drives:
+                if not v.link_ok():
+                    raise TaskFailed("lost the link to the vehicle")
+                if not s.armed:
+                    raise TaskFailed("vehicle disarmed", stop=False)
+                if s.mode == ex.expected_mode:
+                    mode_reached = True
+                elif mode_reached:
+                    raise TaskFailed(f"vehicle left {ex.expected_mode.name} for {s.mode.name}", stop=False)
+                elif time.monotonic() - started > MODE_GRACE_S:
+                    raise TaskFailed(f"vehicle didn't switch to {ex.expected_mode.name} (in {s.mode.name})")
             if active.complete_before and datetime.now(timezone.utc) > active.complete_before:
                 raise TaskFailed("completeBefore passed", "ERROR_CODE_TIMEOUT")
             if await ex.step():
                 return "STATUS_DONE_OK", None, None, "finish"
             await asyncio.sleep(TICK_S)
+
+    def _commanding(self) -> bool:
+        """The vehicle may be moving on the bridge's command: a driving task runs, or a stop hasn't gone through."""
+        return bool(self.active and self.active.executor.drives) or self._stop_pending
 
     async def _stop_vehicle(self) -> None:
         s = self.ctx.vehicle.state
@@ -333,6 +363,7 @@ class TaskManager:
         except CommandError as exc:
             self._stop_pending = True
             log.warning("couldn't stop the vehicle (will retry): %s", exc)
+        self._save()
 
     async def _end(self, reporter: TaskStatusReporter, status: str, code: str | None, message: str | None) -> None:
         self._finished[reporter.task_id] = (status, code, message)
@@ -364,7 +395,7 @@ class TaskManager:
 
     async def _watch_stop(self) -> None:
         v = self.ctx.vehicle
-        if self.active or not v.link_ok():
+        if (self.active and self.active.executor.drives) or not v.link_ok():
             return
         s = v.state
         # Only while it's in a mode we command: an operator driving it by hand isn't overridden, and a
@@ -372,7 +403,11 @@ class TaskManager:
         if not s.armed or s.mode not in _AUTO:
             self._stop_pending = False
             self._stopped_from = None
+            self._save()
             return
+        if self._stopped_from == Mode.MISSION and s.mode != Mode.MISSION:
+            # The stop took effect. A mission started later is the operator's.
+            self._stopped_from = None
         # A stop from Mission switches to Hold; still in Mission means the stop didn't take effect.
         unchanged = self._stopped_from == Mode.MISSION and s.mode == Mode.MISSION and time.monotonic() > self._stop_check_at
         if self._stop_pending or unchanged:
@@ -388,38 +423,48 @@ class TaskManager:
     def _save(self) -> None:
         if not self._state_file:
             return
+        state = json.dumps({"open": sorted(self._open), "commanding": self._commanding()})
+        if state == self._saved:
+            return
         try:
             self._state_file.parent.mkdir(parents=True, exist_ok=True)
-            self._state_file.write_text(json.dumps({"open": sorted(self._open)}))
+            self._state_file.write_text(state)
+            self._saved = state
         except OSError as exc:
             log.warning("couldn't save open tasks: %s", exc)
 
     async def recover(self) -> None:
-        """Stop the vehicle and fail the tasks a previous run of the bridge left open."""
+        """Fail the tasks a previous run of the bridge left open, and stop the vehicle if that run was commanding it."""
         if not self._state_file or not self._state_file.exists():
             return
         try:
-            task_ids = json.loads(self._state_file.read_text()).get("open", [])
-        except (OSError, ValueError):
-            task_ids = []
-        if not task_ids:
-            return
-        await self._stop_vehicle()
+            saved = json.loads(self._state_file.read_text())
+            task_ids = list(saved.get("open", []))
+            # A file from before "commanding" was saved: any open task may have been driving.
+            commanding = bool(saved.get("commanding", task_ids))
+        except (OSError, ValueError, AttributeError, TypeError):
+            task_ids, commanding = [], False
+        # All of them first, so a save during the loop doesn't drop the ones not reached yet.
+        self._open.update({t: TaskStatusReporter(self.ctx.api, t, 0) for t in task_ids})
+        if commanding:
+            await self._stop_vehicle()
         for task_id in task_ids:
-            reporter = TaskStatusReporter(self.ctx.api, task_id, 0)
-            self._open[task_id] = reporter
+            reporter = self._open[task_id]
             await reporter.resync_quietly()
             await self._end(reporter, "STATUS_DONE_NOT_OK", "ERROR_CODE_FAILED", "bridge restarted while running the task")
 
     async def shutdown(self, timeout_s: float = 10.0) -> None:
-        """Stop the vehicle and close every open task, within a bounded time."""
+        """Close every open task within a bounded time, stopping the vehicle if the bridge is commanding it."""
+        commanding = self._commanding()
         a, self.active = self.active, None
         if a and a.runner and not a.runner.done():
             if not a.finishing:
                 a.runner.cancel()
             await asyncio.wait({a.runner}, timeout=timeout_s / 2)
             await a.executor.close()
-        if self._open:
+            if not a.finishing:
+                a.executor.ended("STATUS_DONE_NOT_OK", "bridge stopped")
+        if commanding:
             await self._stop_vehicle()
 
         async def close_all():

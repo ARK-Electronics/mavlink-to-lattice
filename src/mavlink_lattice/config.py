@@ -18,12 +18,13 @@ else:  # JetPack 6 ships Python 3.10
 class VehicleConfig:
     # pymavlink-style address: "udpin:0.0.0.0:14540" listens and replies to whoever sent last;
     # "udpout:host:port" sends to a fixed endpoint.
-    mavlink: str = "udpin:0.0.0.0:14540"
+    mavlink: str = "udpin:127.0.0.1:14540"
     # Autopilot to follow; 0 takes the first PX4 autopilot heard.
     system_id: int = 0
-    # Our own MAVLink identity. "onboard_controller" keeps PX4's GCS-loss failsafe tied to the real GCS;
+    # Our own MAVLink identity. System ID 0 takes the autopilot's, as a component on the vehicle should. PX4 logs
+    # STATUSTEXT only from its own system ID. "onboard_controller" keeps PX4's GCS-loss failsafe tied to the real GCS.
     # "gcs" makes PX4 treat this bridge as a GCS link.
-    source_system: int = 1
+    source_system: int = 0
     source_component: int = 191
     heartbeat_type: str = "onboard_controller"
     link_timeout_s: float = 3.0
@@ -62,11 +63,36 @@ class LatticeConfig:
     heartbeat_interval_s: float = 5.0
 
 
+TASK_NAMES = ("marshal", "transit", "evacuate")
+
+
+@dataclass
+class EvacuateConfig:
+    # The NGC2 Evacuate task's type URL, "type.googleapis.com/<package>.<message>".
+    type_url: str = ""
+    # Where the pickup and dropoff positions sit in the task, as dotted proto field paths. Each must lead to a message
+    # with lat/lon, latitude/longitude or latitude_degrees/longitude_degrees fields. Those fields may also sit below it,
+    # inside an lla, point, position, lla_point or location field. A task may carry either position or both.
+    pickup: str = "pickup"
+    dropoff: str = "dropoff"
+    # The vehicle is at a position once it has stopped or disarmed within this distance of it.
+    arrival_radius_m: float = 10.0
+
+
+@dataclass
+class TasksConfig:
+    # Task types to advertise. Marshal and Transit drive the vehicle from Lattice. Evacuate leaves the driving to the
+    # ground station operator.
+    enabled: list[str] = field(default_factory=lambda: ["marshal", "transit"])
+    evacuate: EvacuateConfig = field(default_factory=EvacuateConfig)
+
+
 @dataclass
 class Config:
     vehicle: VehicleConfig = field(default_factory=VehicleConfig)
     entity: EntityConfig = field(default_factory=EntityConfig)
     lattice: LatticeConfig = field(default_factory=LatticeConfig)
+    tasks: TasksConfig = field(default_factory=TasksConfig)
     # Where the active task ID is kept, so a restarted bridge can close out a task it was running.
     state_dir: str = ""
 
@@ -92,11 +118,14 @@ def load(path: str | os.PathLike | None, env: dict[str, str] | None = None) -> C
     env = os.environ if env is None else env
     raw = tomllib.loads(Path(path).read_text()) if path else {}
     sections = {"vehicle": VehicleConfig, "entity": EntityConfig, "lattice": LatticeConfig}
-    unknown = set(raw) - set(sections) - {"state_dir"}
+    unknown = set(raw) - set(sections) - {"tasks", "state_dir"}
     if unknown:
         raise ValueError(f"unknown config sections: {', '.join(sorted(unknown))}")
+    tasks = dict(raw.get("tasks", {}))
+    evacuate = _build(EvacuateConfig, tasks.pop("evacuate", {}), "tasks.evacuate")
     cfg = Config(
         **{name: _build(cls, raw.get(name, {}), name) for name, cls in sections.items()},
+        tasks=_build(TasksConfig, {**tasks, "evacuate": evacuate}, "tasks"),
         state_dir=raw.get("state_dir", ""),
     )
     for var, (section, key) in _ENV.items():
@@ -115,3 +144,14 @@ def validate(cfg: Config) -> None:
         raise ValueError("vehicle.heartbeat_type must be 'onboard_controller' or 'gcs'")
     if not cfg.vehicle.mavlink.startswith(("udpin:", "udpout:")):
         raise ValueError("vehicle.mavlink must be udpin:<host>:<port> or udpout:<host>:<port>")
+    unknown = set(cfg.tasks.enabled) - set(TASK_NAMES)
+    if unknown:
+        raise ValueError(f"unknown tasks in tasks.enabled: {', '.join(sorted(unknown))} (known: {', '.join(TASK_NAMES)})")
+    if "evacuate" in cfg.tasks.enabled:
+        ev = cfg.tasks.evacuate
+        if not ev.type_url.startswith("type.googleapis.com/"):
+            raise ValueError("tasks.evacuate.type_url must be set to type.googleapis.com/<package>.<message> to enable evacuate")
+        if ev.type_url.removeprefix("type.googleapis.com/").startswith("anduril.tasks."):
+            raise ValueError("tasks.evacuate.type_url can't be one of Anduril's built-in task types")
+        if ev.arrival_radius_m <= 0:
+            raise ValueError("tasks.evacuate.arrival_radius_m must be positive")

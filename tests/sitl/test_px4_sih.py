@@ -6,9 +6,12 @@ PX4_INSTANCE picks the SITL instance (default 7; ports are offset by it, so it c
 
 from __future__ import annotations
 
+import asyncio
 import os
+import queue
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -16,7 +19,7 @@ import pytest
 from pymavlink import mavutil
 
 from mavlink_lattice import geo
-from mavlink_lattice.config import Config, EntityConfig, LatticeConfig, VehicleConfig
+from mavlink_lattice.config import Config, EntityConfig, EvacuateConfig, LatticeConfig, TasksConfig, VehicleConfig
 from mavlink_lattice.vehicle import Mode
 
 from ..conftest import MARSHAL, TOKEN, TRANSIT, Harness, point, wait_until
@@ -54,26 +57,99 @@ def px4(tmp_path_factory):
 
 
 class Gcs:
-    """A second MAVLink peer on PX4's GCS port, standing in for QGC or an RC takeover."""
+    """A second MAVLink peer on PX4's GCS port, standing in for QGC or an RC takeover. A thread reads the port all
+    the time, as QGC does: a backlog would overflow the socket and drop packets. One per PX4 run: PX4 keeps sending
+    to the first peer it heard on the port."""
 
     def __init__(self):
         self.conn = mavutil.mavlink_connection(f"udpout:127.0.0.1:{18570 + INSTANCE}", source_system=255)
-        self.conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
-        self.conn.wait_heartbeat(timeout=10)
+        deadline = time.monotonic() + 60
+        while not self.conn.target_system:
+            if time.monotonic() > deadline:
+                raise AssertionError("no heartbeat from PX4 on its GCS port")
+            self.conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+            self.conn.wait_heartbeat(timeout=1)
+        self.texts: list[str] = []
+        self._mission: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
+
+    def _read(self) -> None:
+        while not self._stop.is_set():
+            m = self.conn.recv_match(blocking=True, timeout=0.2)
+            if m is None:
+                continue
+            if m.get_type() == "STATUSTEXT":
+                self.texts.append(m.text)
+            elif m.get_type() in ("MISSION_COUNT", "MISSION_ITEM_INT"):
+                self._mission.put(m)
 
     def set_mode(self, mode: Mode) -> None:
         self.conn.mav.command_long_send(self.conn.target_system, 1, mavutil.mavlink.MAV_CMD_DO_SET_MODE, 0, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode.main, mode.sub, 0, 0, 0, 0)
 
+    def arm(self) -> None:
+        self.conn.mav.command_long_send(self.conn.target_system, 1, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
+
+    def _mission_reply(self, pred, timeout: float = 2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                m = self._mission.get(timeout=max(deadline - time.monotonic(), 0.01))
+            except queue.Empty:
+                return None
+            if pred(m):
+                return m
+        return None
+
+    def download_mission(self) -> list[tuple[float, float]] | None:
+        """The vehicle's mission waypoints, read the way QGC's Plan view downloads them. None if a reply was lost.
+        Blocking: call it through asyncio.to_thread."""
+        sysid, mission = self.conn.target_system, mavutil.mavlink.MAV_MISSION_TYPE_MISSION
+        self.conn.mav.mission_request_list_send(sysid, 1, mission)
+        count = self._mission_reply(lambda m: m.get_type() == "MISSION_COUNT")
+        if count is None:
+            return None
+        items = []
+        for seq in range(count.count):
+            self.conn.mav.mission_request_int_send(sysid, 1, seq, mission)
+            item = self._mission_reply(lambda m, seq=seq: m.get_type() == "MISSION_ITEM_INT" and m.seq == seq)
+            if item is None:
+                return None
+            items.append(item)
+        self.conn.mav.mission_ack_send(sysid, 1, mavutil.mavlink.MAV_MISSION_ACCEPTED, mission)
+        return [(i.x / 1e7, i.y / 1e7) for i in items if i.command == mavutil.mavlink.MAV_CMD_NAV_WAYPOINT]
+
+    async def wait_mission(self, point: tuple[float, float], timeout: float = 15.0) -> None:
+        deadline = time.monotonic() + timeout
+        while True:
+            got = await asyncio.to_thread(self.download_mission)
+            if got and len(got) == 1 and geo.distance_m(*got[0], *point) < 0.5:
+                return
+            if time.monotonic() > deadline:
+                raise AssertionError(f"vehicle mission is {got}, not {point}")
+            await asyncio.sleep(1.0)
+
     def close(self) -> None:
+        self._stop.set()
+        self._reader.join()
         self.conn.close()
 
 
+@pytest.fixture(scope="module")
+def gcs(px4):
+    g = Gcs()
+    yield g
+    g.close()
+
+
 @pytest.fixture
-async def sitl(px4, fake, tmp_path):
+async def sitl(px4, fake, tasks_cfg, tmp_path):
     cfg = Config(
         vehicle=VehicleConfig(mavlink=f"udpin:127.0.0.1:{14540 + INSTANCE}", auto_arm=True),
         entity=EntityConfig(id=f"px4-sih-{INSTANCE}", publish_period_s=0.5, simulated=True),
         lattice=LatticeConfig(url=fake.url, token=TOKEN, heartbeat_interval_s=1.0),
+        tasks=tasks_cfg,
         state_dir=str(tmp_path),
     )
     h = Harness(fake, None, cfg)
@@ -133,19 +209,49 @@ async def test_cancel_stops_the_rover(sitl):
     await wait_until(lambda: s.ground_speed_mps < 0.3, timeout=10, what="rover to stop")
 
 
-async def test_gcs_takeover_fails_the_task(sitl):
+async def test_gcs_takeover_fails_the_task(sitl, gcs):
     task_id = await sitl.create(MARSHAL, {"objective": {"point": point(*ahead(sitl, 200))}})
     await sitl.wait_status(task_id, "STATUS_EXECUTING")
     s = sitl.bridge.vehicle.state
     await wait_until(lambda: s.ground_speed_mps > 1.0, timeout=15, what="rover driving")
-    gcs = Gcs()
-    try:
-        gcs.set_mode(Mode.RTL)
-        assert await sitl.wait_terminal(task_id) == "STATUS_DONE_NOT_OK"
-    finally:
-        gcs.close()
+    gcs.set_mode(Mode.RTL)
+    assert await sitl.wait_terminal(task_id) == "STATUS_DONE_NOT_OK"
     assert sitl.error(task_id) == {"code": "ERROR_CODE_FAILED", "message": "vehicle left HOLD for RTL"}
     assert s.mode == Mode.RTL
     # Leave the rover parked for the next test.
     await sitl.bridge.vehicle.hold()
     time.sleep(0.5)
+
+
+EVACUATE = "type.googleapis.com/test.ngc2.v1.Evacuate"
+
+
+@pytest.mark.parametrize("tasks_cfg", [TasksConfig(enabled=["evacuate"], evacuate=EvacuateConfig(type_url=EVACUATE, arrival_radius_m=5.0))])
+async def test_evacuate_operator_drives(sitl, gcs):
+    """The bridge stages each position as PX4's mission and reports progress. The GCS peer plays the operator."""
+    pickup, dropoff = ahead(sitl, 15), ahead(sitl, 15, 15)
+    s = sitl.bridge.vehicle.state
+    gcs.texts.clear()
+    try:
+        task_id = await sitl.create(EVACUATE, {"pickup": point(*pickup), "dropoff": point(*dropoff)})
+        await sitl.wait_status(task_id, "STATUS_EXECUTING")
+        await gcs.wait_mission(pickup)
+        # PX4 forwards the bridge's STATUSTEXT from its onboard link to the ground station link.
+        await wait_until(lambda: any(t.startswith("Lattice") for t in gcs.texts), timeout=5, what="STATUSTEXT at the GCS")
+
+        gcs.arm()
+        await wait_until(lambda: s.armed, timeout=5, what="armed by the GCS")
+        gcs.set_mode(Mode.MISSION)
+        executor = sitl.bridge.manager.active.executor
+        await wait_until(lambda: executor.leg == 1, timeout=60, what="at the pickup")
+        if s.mode == Mode.MISSION:  # PX4 main switches to Hold at the end. One that stays in Mission makes the bridge wait.
+            gcs.set_mode(Mode.HOLD)
+        await gcs.wait_mission(dropoff)
+        await wait_until(lambda: s.ground_speed_mps < 0.3, timeout=5, what="still parked at the pickup")
+
+        gcs.set_mode(Mode.MISSION)
+        assert await sitl.wait_terminal(task_id, timeout=60) == "STATUS_DONE_OK", sitl.error(task_id)
+        assert sitl.fake.statuses(task_id) == DONE
+        assert geo.distance_m(*here(sitl), *dropoff) <= 5.0
+    finally:
+        gcs.set_mode(Mode.HOLD)

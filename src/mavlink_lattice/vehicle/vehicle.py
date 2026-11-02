@@ -36,7 +36,7 @@ class CommandError(Exception):
 class Vehicle:
     def __init__(self, cfg: VehicleConfig, link: MavlinkLink | None = None):
         self.cfg = cfg
-        self.link = link or MavlinkLink(cfg.mavlink, cfg.source_system, cfg.source_component)
+        self.link = link or MavlinkLink(cfg.mavlink, cfg.source_system or cfg.system_id or 1, cfg.source_component)
         self.link.add_handler(self._on_message)
         self.state = VehicleState(system_id=cfg.system_id)
         self.target_component = mavlink.MAV_COMP_ID_AUTOPILOT1
@@ -77,6 +77,8 @@ class Vehicle:
             return src == self.state.system_id
         if msg.get_type() == "HEARTBEAT" and msg.autopilot == mavlink.MAV_AUTOPILOT_PX4:
             self.state.system_id = src
+            if not self.cfg.source_system:
+                self.link.mav.srcSystem = src
             log.info("following autopilot system %d", src)
             return True
         return False
@@ -118,6 +120,11 @@ class Vehicle:
                 self._was_connected = False
                 log.warning("vehicle link lost")
             await asyncio.sleep(1.0)
+
+    def notify(self, text: str, severity: int = mavlink.MAV_SEVERITY_NOTICE) -> None:
+        """Show a message in the ground station. It gets there only if mavlink-router or PX4's forwarding passes it
+        to the GCS link, since PX4 itself only writes it to its log. Cut to MAVLink's 50 characters."""
+        self.link.send(self.link.mav.statustext_encode(severity, text[:50].encode()))
 
     async def request_message(self, msg_id: int) -> None:
         await self.command(mavlink.MAV_CMD_REQUEST_MESSAGE, msg_id, timeout=0.5, retries=2)
@@ -223,17 +230,19 @@ class Vehicle:
             alt,
         )
 
-    async def upload_route(self, points: list[tuple[float, float]]) -> int:
+    async def upload_route(self, points: list[tuple[float, float]], before_send: Callable[[], None] | None = None) -> int:
         """Upload waypoints as a mission. Returns the sequence number of the last waypoint."""
         items = []
         if self.cfg.speed_mps > 0:
             items.append((mavlink.MAV_CMD_DO_CHANGE_SPEED, mavlink.MAV_FRAME_MISSION, (1, self.cfg.speed_mps, -1, 0), 0, 0))
         for lat, lon in points:
             items.append((mavlink.MAV_CMD_NAV_WAYPOINT, mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, (0, 0, 0, math.nan), int(round(lat * 1e7)), int(round(lon * 1e7))))
-        await self.upload_mission(items)
+        await self.upload_mission(items, before_send)
         return len(items) - 1
 
-    async def upload_mission(self, items: list[tuple]) -> None:
+    async def upload_mission(self, items: list[tuple], before_send: Callable[[], None] | None = None) -> None:
+        """`before_send` is called before each MISSION_COUNT, once the upload holds the link. Raising from it
+        abandons the upload before PX4 has taken any of it."""
         sysid, comp = self.state.system_id, self.target_component
 
         def encode(seq: int):
@@ -249,6 +258,8 @@ class Vehicle:
             last_sent = self.link.mav.mission_count_encode(sysid, comp, len(items), mavlink.MAV_MISSION_TYPE_MISSION)
             retries = 0
             while True:
+                if before_send and last_sent.get_type() == "MISSION_COUNT":
+                    before_send()
                 waiter = asyncio.ensure_future(self.wait_message(is_reply, 1.5))
                 await asyncio.sleep(0)
                 self.link.send(last_sent)

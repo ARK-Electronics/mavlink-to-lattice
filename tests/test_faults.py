@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -10,6 +11,7 @@ from pymavlink.dialects.v20 import common as mavlink
 
 from mavlink_lattice import geo
 from mavlink_lattice.tasks import manager
+from mavlink_lattice.vehicle import Mode
 
 from .conftest import MARSHAL, TRANSIT, point, wait_until
 from .test_bridge import _publish_target, ahead
@@ -134,3 +136,18 @@ async def test_slow_lattice_doesnt_delay_safety_checks(harness):
     assert await harness.wait_terminal(task_id, timeout=30) == "STATUS_DONE_NOT_OK"
     assert harness.error(task_id)["code"] == "ERROR_CODE_TIMEOUT"
     assert harness.fake.statuses(task_id)[-2:] == ["STATUS_EXECUTING", "STATUS_DONE_NOT_OK"]
+
+
+async def test_operator_mission_after_a_stop_is_left_alone(harness):
+    """The stop watchdog re-stops a vehicle that stayed in Mission, not one an operator put back in Mission later."""
+    path = [{"waypoint": {"llaPoint": point(*ahead(harness, 2000))}}]
+    task_id = await harness.create(TRANSIT, {"plan": {"route": {"path": path}}})
+    await harness.wait_status(task_id, "STATUS_EXECUTING")
+    await wait_until(lambda: harness.bridge.vehicle.state.mode == Mode.MISSION, what="bridge sees Mission")
+    await harness.operator.tasks.cancel_task(task_id)
+    await harness.wait_terminal(task_id)
+    await wait_until(lambda: stopped(harness) and harness.sim.mode == Mode.HOLD, timeout=3, what="stopped")
+    await asyncio.sleep(1.5)  # the watchdog sees the stop took effect
+    harness.sim.take_over(Mode.MISSION)
+    await asyncio.sleep(manager.MODE_GRACE_S + 1.5)
+    assert harness.sim.mode == Mode.MISSION and harness.sim.vel != (0.0, 0.0)
