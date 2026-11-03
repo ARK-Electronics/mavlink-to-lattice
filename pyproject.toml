@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mavlink-lattice"
+version = "0.1.0"
+description = "Bridge between a MAVLink vehicle and Anduril Lattice: publishes the vehicle as a taskable asset and executes Lattice tasks"
+readme = "README.md"
+license = "BSD-3-Clause"
+requires-python = ">=3.10"
+dependencies = [
+    "anduril-lattice-sdk>=5.4,<6",
+    "httpx>=0.21.2",
+    "pymavlink>=2.4.41",
+    "tomli>=2; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+# The fake Lattice server, used by the tests and for local development without an Anduril environment.
+fake = [
+    "aiohttp>=3.9",
+    "jsonschema>=4.21",
+]
+test = [
+    "mavlink-lattice[fake]",
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+mavlink-lattice = "mavlink_lattice.__main__:main"
+lattice-task = "mavlink_lattice.operator:main"
+fake-lattice = "mavlink_lattice.testing.fake_lattice:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mavlink_lattice"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["sitl: needs a PX4 build (set PX4_DIR); runs PX4's SIH rover simulator"]
+addopts = "-m 'not sitl'"

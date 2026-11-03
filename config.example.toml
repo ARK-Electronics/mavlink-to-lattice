@@ -1,0 +1,39 @@
+# mavlink-lattice configuration. LATTICE_URL, LATTICE_TOKEN, LATTICE_CLIENT_ID, LATTICE_CLIENT_SECRET and
+# LATTICE_SANDBOX_TOKEN in the environment override the [lattice] values, so secrets can stay out of this file.
+
+# Remembers the running task, so a bridge restart closes it out instead of leaving it executing in Lattice.
+state_dir = "/var/lib/mavlink-lattice"
+
+[vehicle]
+# A mavlink-router UDP endpoint on the companion computer, or PX4 SITL's onboard port (14540 + instance).
+mavlink = "udpin:127.0.0.1:14540"
+# Arm the vehicle when a task arrives. Off: tasks sent to a disarmed vehicle are rejected.
+auto_arm = false
+arrival_radius_m = 2.0
+# 0 keeps PX4's cruise speed.
+speed_mps = 0.0
+
+[tasks]
+# Marshal and Transit drive the vehicle from Lattice. Evacuate leaves the driving to the ground station operator.
+# Enable it alone to keep Lattice from driving the vehicle.
+enabled = ["marshal", "transit"]
+
+[tasks.evacuate]
+# Required with "evacuate" enabled: the Evacuate task's type URL.
+type_url = ""
+# Dotted proto field paths to the pickup and dropoff positions in the task.
+pickup = "pickup"
+dropoff = "dropoff"
+arrival_radius_m = 10.0
+
+[entity]
+# Empty: derived from the autopilot's hardware UID ("mavlink-<uid>").
+id = ""
+name = ""
+simulated = false
+
+[lattice]
+url = "https://your-environment.developer.anduril.com"
+# token = ""          # or client_id + client_secret
+# client_id = ""
+# client_secret = ""
